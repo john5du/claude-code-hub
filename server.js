@@ -136,12 +136,18 @@ async function handleWebSocketConnection(ws, req) {
   // the client WebSocket disconnects mid-stream — otherwise the SSE consumer
   // (and provider concurrency / breaker counters) keep running for minutes.
   let currentInternalReq = null;
+  let markCurrentInternalReqAbort = null;
 
   const abortCurrentInternalReq = () => {
     if (!currentInternalReq) return;
     const reqToDestroy = currentInternalReq;
+    const markAbort = markCurrentInternalReqAbort;
     currentInternalReq = null;
+    markCurrentInternalReqAbort = null;
     try {
+      if (typeof markAbort === "function") {
+        markAbort();
+      }
       if (!reqToDestroy.destroyed) {
         reqToDestroy.destroy();
       }
@@ -272,13 +278,15 @@ async function handleWebSocketConnection(ws, req) {
       req,
       body,
       responsesWsSessionId,
-      (clientReq) => {
+      (clientReq, markAbort) => {
         currentInternalReq = clientReq;
+        markCurrentInternalReqAbort = typeof markAbort === "function" ? markAbort : null;
       },
       requestClose
     );
     if (!closed) {
       currentInternalReq = null;
+      markCurrentInternalReqAbort = null;
     }
   };
 
@@ -600,12 +608,22 @@ async function forwardToInternalHttp(
       }
     );
 
+    let intentionallyAborted = false;
+    const markIntentionalAbort = () => {
+      intentionallyAborted = true;
+    };
+
     req.on("error", (err) => {
-      // ECONNRESET when we destroy() the request on client disconnect is
-      // expected; downgrade to debug to avoid noisy logs in normal traffic.
+      // ECONNRESET is only quiet when it comes from our own abort path after
+      // the client WebSocket disappeared. A reset from the internal handler
+      // itself must surface to the WebSocket client as a diagnostic event.
       const errCode = err && (err.code || err.name);
       const isAbort = errCode === "ECONNRESET" || errCode === "ERR_STREAM_PREMATURE_CLOSE";
-      if (!isAbort) {
+      if (!isAbort || !intentionallyAborted) {
+        log("warn", "ws_internal_request_error", {
+          code: typeof errCode === "string" ? errCode : null,
+          error: String(err && err.message ? err.message : err),
+        });
         emitErrorEvent(
           ws,
           "internal_request_error",
@@ -617,7 +635,7 @@ async function forwardToInternalHttp(
     });
 
     if (typeof registerInternalReq === "function") {
-      registerInternalReq(req);
+      registerInternalReq(req, markIntentionalAbort);
     }
     req.write(payload);
     req.end();

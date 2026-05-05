@@ -1193,6 +1193,28 @@ describe("CCH Responses WebSocket edge E2E", () => {
     }
   });
 
+  test("sends an error frame before closing when the internal request resets before headers", async () => {
+    const { harness, close } = await startIsolatedCchEdgeHarness();
+    try {
+      harness.setResponseHandler(({ res }) => {
+        res.socket?.destroy();
+      });
+
+      const client = connectRawWsClient(harness.port);
+      await client.opened;
+      sendResponseCreate(client, { model, input: "reset-before-headers" });
+      await client.nextMessage(
+        errorEvent("internal_request_error"),
+        3000,
+        "request reset before headers did not surface as a diagnostic error"
+      );
+      const closeEvent = await client.closeEvent;
+      expect(closeEvent).toEqual({ code: 1011, reason: "internal_request_error" });
+    } finally {
+      await close();
+    }
+  });
+
   test("aborts the in-flight internal request and drops queued frames when a client vanishes", async () => {
     const { harness, close } = await startIsolatedCchEdgeHarness();
     try {
